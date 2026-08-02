@@ -35,12 +35,13 @@ jobs:
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python scrape_sade_reviews.py
 
-      # 6. SIMPAN SEBAGAI ARTIFACT (Jaminan 100% File Bisa Di-download)
+      # 6. Upload CSV Artifacts (Aman dari Warning Missing File)
       - name: Upload CSV Artifact
         uses: actions/upload-artifact@v4
         with:
           name: sade-reviews-dataset
           path: sade_village_reviews_clean_5000.csv
+          if-no-files-found: warn
 
       # 7. Commit and Push ke Repository Utama
       - name: Commit and Push Clean Dataset
