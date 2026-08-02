@@ -21,6 +21,7 @@ from loguru import logger
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
@@ -40,7 +41,7 @@ class GoogleMapsScraper:
         output_csv: str = "sade_village_reviews_clean_5000.csv",
         checkpoint_file: str = "sade_checkpoint.json",
         target_count: int = 5000,
-        autosave_interval: int = 100,
+        autosave_interval: int = 50,
         max_no_change: int = 15
     ) -> None:
         self.target_url: str = target_url
@@ -113,7 +114,7 @@ class GoogleMapsScraper:
     def _save_checkpoint(self) -> None:
         """Menyimpan dataset terkumpul ke file CSV."""
         if not self.scraped_data:
-            # Buat file kosong berstruktur jika belum ada data sama sekali
+            # Buat file CSV berstruktur dasar jika belum ada data
             df_empty = pd.DataFrame(columns=[
                 "review_id", "nama_pengguna", "rating", "ulasan_pengunjung",
                 "tanggal_review", "jumlah_suka", "local_guide", "scraped_at", "source", "place"
@@ -157,14 +158,17 @@ class GoogleMapsScraper:
 
         # Klik Tab Ulasan
         try:
-            buttons = self.driver.find_elements(By.XPATH, "//button[contains(@aria-label, 'Ulasan') or contains(@aria-label, 'Reviews') or contains(., 'Ulasan')]")
+            buttons = self.driver.find_elements(
+                By.XPATH, 
+                "//button[contains(@aria-label, 'Ulasan') or contains(@aria-label, 'Reviews') or contains(., 'Ulasan')]"
+            )
             if buttons:
                 self.driver.execute_script("arguments[0].click();", buttons[0])
                 time.sleep(4)
         except Exception as e:
             logger.warning(f"Info tab ulasan: {e}")
 
-    def _find_scrollable_container(0) -> Any:
+    def _find_scrollable_container(self) -> Any:
         """Mencari kontainer scroll ulasan dengan multi-fallback."""
         scroll_script = """
             let containers = Array.from(document.querySelectorAll('div'));
@@ -310,6 +314,9 @@ class GoogleMapsScraper:
     def scrape(self) -> None:
         self._load_checkpoint()
         self._init_driver()
+        
+        # Buat file CSV kosong awal agar artefak GitHub Actions selalu menemukan file jika terjadi timeout
+        self._save_checkpoint()
 
         try:
             self._setup_page()
@@ -328,7 +335,6 @@ class GoogleMapsScraper:
 
                 pbar.update(current_total_count - pbar.n)
 
-                # Paksa simpan setiap menemukan data baru agar file CSV selalu ada
                 if new_items_count > 0:
                     self._save_checkpoint()
 
