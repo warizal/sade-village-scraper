@@ -1,9 +1,7 @@
 name: Google Maps Sade Review Scraper
 
 on:
-  workflow_dispatch: # Tombol manual untuk menjalankan scraper dari UI GitHub
-  schedule:
-    - cron: '0 0 * * 0' # Berjalan otomatis seminggu sekali (Hari Minggu)
+  workflow_dispatch:
 
 jobs:
   scrape:
@@ -37,7 +35,14 @@ jobs:
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python scrape_sade_reviews.py
 
-      # 6. Simpan File CSV Dataset ke Repository GitHub secara Otomatis
+      # 6. SIMPAN SEBAGAI ARTIFACT (Jaminan 100% File Bisa Di-download)
+      - name: Upload CSV Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sade-reviews-dataset
+          path: sade_village_reviews_clean_5000.csv
+
+      # 7. Commit and Push ke Repository Utama
       - name: Commit and Push Clean Dataset
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
