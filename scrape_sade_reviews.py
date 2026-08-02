@@ -1,7 +1,7 @@
 """
-GOOGLE MAPS REVIEWS SCRAPER FOR INDOBERT SENTIMENT ANALYSIS
+GOOGLE MAPS REVIEWS SCRAPER FOR INDOBERT SENTIMENT ANALYSIS (PLAYWRIGHT ENGINE)
 Target Location : Sade Village (Desa Sade), Lombok Tengah, NTB, Indonesia
-Environment     : GitHub Actions / Cloud Headless Linux Xvfb
+Environment     : GitHub Actions / Cloud Linux Container
 Author          : Senior Python Data Engineer & ML Researcher
 Language        : Python 3.13
 """
@@ -10,31 +10,19 @@ import os
 import re
 import time
 import json
+import asyncio
 from datetime import datetime
-from typing import List, Dict, Set, Optional, Any
+from typing import List, Dict, Set, Any, Optional
 
 import pandas as pd
-import numpy as np
-import openpyxl
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 from loguru import logger
-
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    TimeoutException,
-    NoSuchElementException,
-    StaleElementReferenceException,
-    WebDriverException
-)
+from playwright.async_api import async_playwright, Page, BrowserContext
 
 
-class GoogleMapsScraper:
-    """Scraper profesional Google Maps Reviews untuk Dataset Penelitian Sentimen IndoBERT."""
+class GoogleMapsPlaywrightScraper:
+    """Scraper profesional Google Maps berbasis Playwright Async untuk Dataset IndoBERT."""
 
     def __init__(
         self,
@@ -42,17 +30,14 @@ class GoogleMapsScraper:
         output_csv: str = "sade_village_reviews_clean_5000.csv",
         checkpoint_file: str = "sade_checkpoint.json",
         target_count: int = 5000,
-        autosave_interval: int = 50,
-        max_no_change: int = 20
+        max_no_change: int = 25
     ) -> None:
         self.target_url: str = target_url
         self.output_csv: str = output_csv
         self.checkpoint_file: str = checkpoint_file
         self.target_count: int = target_count
-        self.autosave_interval: int = autosave_interval
         self.max_no_change: int = max_no_change
 
-        self.driver: Optional[webdriver.Chrome] = None
         self.scraped_data: List[Dict[str, Any]] = []
         self.unique_hashes: Set[str] = set()
 
@@ -64,41 +49,13 @@ class GoogleMapsScraper:
             format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
         )
 
-    def _init_driver(self) -> None:
-        """Inisialisasi Chrome WebDriver khusus untuk Cloud Runner (GitHub Actions)."""
-        logger.info("Menginisialisasi Chrome WebDriver untuk GitHub Actions...")
-        options = webdriver.ChromeOptions()
-
-        options.add_argument("--window-size=1920,1080")
-        options.add_argument("--start-maximized")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--lang=id-ID,id,en-US,en")
-
-        prefs = {
-            "profile.default_content_setting_values.notifications": 2,
-            "translate": {"enabled": False}
-        }
-        options.add_experimental_option("prefs", prefs)
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option("useAutomationExtension", False)
-
-        self.driver = webdriver.Chrome(options=options)
-        self.driver.execute_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
-        logger.info("WebDriver berhasil diinisialisasi.")
-
     def _load_checkpoint(self) -> None:
-        """Memuat checkpoint terakhir jika ada file CSV sebelumnya."""
+        """Memuat checkpoint terakhir jika file CSV sudah terbentuk dari iterasi sebelumnya."""
         if os.path.exists(self.checkpoint_file) and os.path.exists(self.output_csv):
             try:
                 df_existing = pd.read_csv(self.output_csv)
                 if not df_existing.empty and "ulasan_pengunjung" in df_existing.columns:
                     self.scraped_data = df_existing.to_dict("records")
-
                     for item in self.scraped_data:
                         hash_key = self._generate_hash(
                             str(item.get("nama_pengguna")),
@@ -106,15 +63,14 @@ class GoogleMapsScraper:
                             str(item.get("tanggal_review"))
                         )
                         self.unique_hashes.add(hash_key)
-
-                    logger.info(f"[RESUME] Berhasil memuat checkpoint! Total {len(self.scraped_data)} data.")
+                    logger.info(f"[RESUME] Berhasil memuat {len(self.scraped_data)} data dari checkpoint.")
             except Exception as e:
-                logger.error(f"Gagal memuat checkpoint: {e}. Memulai dari awal.")
+                logger.error(f"Gagal memuat checkpoint: {e}. Memulai baru.")
                 self.scraped_data = []
                 self.unique_hashes = set()
 
     def _save_checkpoint(self) -> None:
-        """Menyimpan data terkumpul ke CSV."""
+        """Menyimpan data terkumpul ke file CSV secara berkala."""
         if not self.scraped_data:
             df_empty = pd.DataFrame(columns=[
                 "review_id", "nama_pengguna", "rating", "ulasan_pengunjung",
@@ -147,95 +103,9 @@ class GoogleMapsScraper:
         clean_str = f"{name.strip().lower()}_{text.strip().lower()}_{date.strip().lower()}"
         return str(hash(clean_str))
 
-    def _clear_overlays(self) -> None:
-        """Bypass Pop-up Consent/Cookie Google via Injection Script."""
-        try:
-            js_script = """
-                let selectors = ['button[aria-label*="Accept"]', 'button[aria-label*="Terima"]', 'form[action*="consent"] button'];
-                selectors.forEach(s => {
-                    let btns = document.querySelectorAll(s);
-                    btns.forEach(b => b.click());
-                });
-            """
-            self.driver.execute_script(js_script)
-            time.sleep(2)
-        except Exception:
-            pass
-
-    def _setup_page(self) -> None:
-        """Membuka tautan target Google Maps."""
-        if not self.driver:
-            raise RuntimeError("Driver belum diaktifkan.")
-
-        logger.info(f"Navigasi ke URL target Google Maps: {self.target_url}")
-        self.driver.get(self.target_url)
-        time.sleep(10)
-
-        self._clear_overlays()
-
-        # Coba klik Tab Ulasan jika belum terbuka
-        try:
-            buttons = self.driver.find_elements(
-                By.XPATH,
-                "//button[contains(@aria-label, 'Ulasan') or contains(@aria-label, 'Reviews') or contains(., 'Ulasan') or contains(., 'Reviews')]"
-            )
-            for btn in buttons:
-                if btn.is_displayed():
-                    self.driver.execute_script("arguments[0].click();", btn)
-                    logger.info("Tab ulasan diklik.")
-                    time.sleep(4)
-                    break
-        except Exception as e:
-            logger.warning(f"Info pembukaan tab: {e}")
-
-    def _find_scrollable_container(self) -> Any:
-        """Mencari elemen scrollbar kontainer ulasan."""
-        scroll_script = """
-            let containers = Array.from(document.querySelectorAll('div'));
-            return containers.find(c => {
-                let style = window.getComputedStyle(c);
-                return (style.overflowY === 'auto' || style.overflowY === 'scroll') && c.scrollHeight > 300;
-            });
-        """
-        try:
-            container = self.driver.execute_script(scroll_script)
-            if container:
-                return container
-        except Exception:
-            pass
-
-        selectors = [
-            "//div[contains(@class, 'm6QE1c') and contains(@class, 'DshB1')]",
-            "//div[@role='main']",
-            "//div[contains(@class, 'm6QE1c')]"
-        ]
-        for xpath in selectors:
-            elements = self.driver.find_elements(By.XPATH, xpath)
-            for el in elements:
-                try:
-                    if el.size["height"] > 150:
-                        return el
-                except Exception:
-                    continue
-
-        return None
-
-    def _expand_review_texts(self) -> None:
-        """Mengeklik tombol 'Selengkapnya' / 'More'."""
-        try:
-            more_buttons = self.driver.find_elements(
-                By.XPATH,
-                "//button[contains(@aria-label, 'Lainnya') or contains(text(), 'Lainnya') or contains(text(), 'More') or contains(text(), 'Selengkapnya')]"
-            )
-            for btn in more_buttons[:10]:
-                if btn.is_displayed():
-                    self.driver.execute_script("arguments[0].click();", btn)
-        except Exception:
-            pass
-
     @staticmethod
     def _clean_original_text(raw_text: str) -> str:
-        """Mempertahankan teks asli (original) tanpa terjemahan Google."""
+        """Memisahkan teks terjemahan dan mempertahankan teks ulasan asli (Original)."""
         if not raw_text:
             return ""
 
@@ -253,16 +123,36 @@ class GoogleMapsScraper:
 
         return " ".join(raw_text.replace("\n", " ").split())
 
-    def _extract_reviews_from_dom(self) -> int:
-        """Mengekstrak ulasan dari HTML DOM."""
-        soup = BeautifulSoup(self.driver.page_source, "html.parser")
-        
-        # Cari elemen review
+    async def _dismiss_popups(self, page: Page) -> None:
+        """Menutup dialog Cookie / Form Consent Google jika muncul."""
+        try:
+            selectors = [
+                "button[aria-label*='Accept']",
+                "button[aria-label*='Terima']",
+                "form[action*='consent'] button",
+                "button:has-text('Accept all')",
+                "button:has-text('Saya setuju')"
+            ]
+            for sel in selectors:
+                btn = page.locator(sel).first
+                if await btn.is_visible():
+                    await btn.click()
+                    logger.info("Pop-up Cookie Consent berhasil dilewati.")
+                    await page.wait_for_timeout(3000)
+                    break
+        except Exception:
+            pass
+
+    async def _extract_reviews(self, page: Page) -> int:
+        """Mengekstrak kartu ulasan dari struktur DOM HTML."""
+        content = await page.content()
+        soup = BeautifulSoup(content, "html.parser")
+
         review_cards = soup.find_all("div", attrs={"data-review-id": True})
         if not review_cards:
             review_cards = soup.find_all("div", class_=lambda c: c and ("jftiB" in c or "G532fb" in c))
 
-        new_records_added = 0
+        new_added = 0
         for card in review_cards:
             try:
                 # 1. Nama Pengguna
@@ -285,11 +175,11 @@ class GoogleMapsScraper:
                     date_el = card.find("span", text=re.compile(r"(lalu|ago|bulan|tahun|minggu|hari)", re.I))
                 tanggal_review = date_el.text.strip() if date_el else ""
 
-                # 4. Teks Ulasan Original
+                # 4. Teks Ulasan
                 text_el = card.find("span", class_=lambda c: c and ("wi832d" in c or "MyT2O" in c or "wiI7pd" in c))
                 if not text_el:
                     text_el = card.find("div", class_=lambda c: c and ("TOw1ed" in c or "MyEned" in c))
-                
+
                 raw_text = text_el.text.strip() if text_el else ""
                 clean_original_text = self._clean_original_text(raw_text)
 
@@ -310,7 +200,7 @@ class GoogleMapsScraper:
                 if lg_el or card.find("span", class_=lambda c: c and "RfnDt" in c):
                     local_guide = "Ya"
 
-                # Hash Deduplikasi
+                # Deduplikasi
                 hash_key = self._generate_hash(nama_pengguna, clean_original_text, tanggal_review)
 
                 if hash_key not in self.unique_hashes:
@@ -326,96 +216,112 @@ class GoogleMapsScraper:
                         "source": "Google Maps",
                         "place": "Sade Village"
                     })
-                    new_records_added += 1
+                    new_added += 1
 
-            except Exception as e:
-                logger.debug(f"Parsing card error: {e}")
+            except Exception:
                 continue
 
-        return new_records_added
+        return new_added
 
-    def _scroll_action(self, scroll_container: Any) -> None:
-        """Gulirkan halaman menggunakan JavaScript & Keyboard Events."""
-        scrolled = False
-        if scroll_container:
-            try:
-                self.driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", scroll_container)
-                scrolled = True
-            except Exception:
-                pass
-
-        try:
-            # Sinyal Keyboard ke Body untuk memicu Lazy Load Google Maps
-            body = self.driver.find_element(By.TAG_NAME, "body")
-            body.send_keys(Keys.PAGE_DOWN)
-            body.send_keys(Keys.END)
-        except Exception:
-            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-
-    def scrape(self) -> None:
-        """Eksekusi utama Scraping."""
+    async def run(self) -> None:
+        """Eksekusi utama Playwright Scraper."""
         self._load_checkpoint()
-        self._init_driver()
-        
-        # Buat/Inisialisasi file CSV di awal
         self._save_checkpoint()
 
-        try:
-            self._setup_page()
+        async with async_playwright() as p:
+            logger.info("Memulai Browser Playwright Chromium...")
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--lang=id-ID,id,en-US,en"
+                ]
+            )
+            context: BrowserContext = await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                locale="id-ID"
+            )
+            page: Page = await context.new_page()
 
-            scroll_container = self._find_scrollable_container()
-            no_new_data_counter = 0
-            last_total_count = len(self.scraped_data)
+            logger.info(f"Navigasi ke target URL: {self.target_url}")
+            await page.goto(self.target_url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(8000)
 
-            pbar = tqdm(total=self.target_count, initial=last_total_count, desc="Scraping Reviews Sade")
+            await self._dismiss_popups(page)
+
+            # Buka Tab Ulasan / Reviews
+            try:
+                review_tab = page.locator("button:has-text('Ulasan'), button:has-text('Reviews')").first
+                if await review_tab.is_visible():
+                    await review_tab.click()
+                    logger.info("Tab ulasan berhasil diklik.")
+                    await page.wait_for_timeout(4000)
+            except Exception as e:
+                logger.warning(f"Info tab ulasan: {e}")
+
+            # Expand tombol 'Selengkapnya'
+            async def expand_more():
+                try:
+                    more_btns = await page.locator("button:has-text('Selengkapnya'), button:has-text('Lainnya'), button:has-text('More')").all()
+                    for b in more_btns[:10]:
+                        if await b.is_visible():
+                            await b.click()
+                except Exception:
+                    pass
+
+            no_change_counter = 0
+            last_total = len(self.scraped_data)
+            pbar = tqdm(total=self.target_count, initial=last_total, desc="Scraping Review Sade")
 
             while True:
-                self._expand_review_texts()
+                await expand_more()
+                new_added = await self._extract_reviews(page)
+                current_total = len(self.scraped_data)
 
-                new_items_count = self._extract_reviews_from_dom()
-                current_total_count = len(self.scraped_data)
+                pbar.update(current_total - pbar.n)
 
-                pbar.update(current_total_count - pbar.n)
-
-                # Simpan berkala setiap menemukan data baru
-                if new_items_count > 0:
+                if new_added > 0:
                     self._save_checkpoint()
 
-                if current_total_count == last_total_count:
-                    no_new_data_counter += 1
-                    logger.warning(f"Scroll dilakukan, belum ada data baru bertambah ({no_new_data_counter}/{self.max_no_change})")
-
-                    if no_new_data_counter % 3 == 0:
-                        scroll_container = self._find_scrollable_container()
+                if current_total == last_total:
+                    no_change_counter += 1
+                    logger.warning(f"Scroll dilakukan, belum ada ulasan baru bertambah ({no_change_counter}/{self.max_no_change})")
                 else:
-                    no_new_data_counter = 0
-                    last_total_count = current_total_count
+                    no_change_counter = 0
+                    last_total = current_total
 
-                if no_new_data_counter >= self.max_no_change:
-                    logger.info(f"Proses dihentikan: Stagnan selama {self.max_no_change} kali scroll.")
+                if no_change_counter >= self.max_no_change:
+                    logger.info(f"Scraping selesai: Data stagnan selama {self.max_no_change} kali scroll.")
                     break
 
-                if current_total_count >= self.target_count:
+                if current_total >= self.target_count:
                     logger.info(f"Target minimal {self.target_count} dataset bersih tercapai!")
                     break
 
-                self._scroll_action(scroll_container)
-                time.sleep(3.5)
+                # Lakukan Gerakan Scroll di Kontainer Review
+                try:
+                    # Targetkan elemen kontainer ulasan
+                    scroll_container = page.locator("div.m6QE1c.DshB1, div[role='main'], div.m6QE1c").first
+                    if await scroll_container.is_visible():
+                        await scroll_container.evaluate("el => el.scrollTop = el.scrollHeight")
+                    else:
+                        await page.mouse.wheel(0, 1500)
+                except Exception:
+                    await page.keyboard.press("PageDown")
+
+                await page.wait_for_timeout(3000)
 
             pbar.close()
             self._save_checkpoint()
-            logger.success(f"PROSES SELESAI! Total dataset original Desa Sade tersimpan: {len(self.scraped_data)} data.")
-
-        except Exception as e:
-            logger.critical(f"Terjadi error fatal selama proses scraping: {e}")
-            self._save_checkpoint()
-        finally:
-            if self.driver:
-                self.driver.quit()
+            await browser.close()
+            logger.success(f"SELESAI! Total dataset terkumpul: {len(self.scraped_data)} ulasan.")
 
 
 if __name__ == "__main__":
-    # URL Direct Reviews Feed Sade Village
     URL_DESA_SADE = (
         "https://www.google.com/maps/place/Sade+Village/"
         "@-8.839218,116.2917036,17z/data=!4m8!3m7!"
@@ -423,13 +329,12 @@ if __name__ == "__main__":
         "8m2!3d-8.839218!4d116.2942785!9m1!1b1!16s%2Fg%2F11b6vh993q?entry=ttu"
     )
 
-    scraper = GoogleMapsScraper(
+    scraper = GoogleMapsPlaywrightScraper(
         target_url=URL_DESA_SADE,
         output_csv="sade_village_reviews_clean_5000.csv",
         checkpoint_file="sade_checkpoint.json",
         target_count=5000,
-        autosave_interval=50,
-        max_no_change=20
+        max_no_change=25
     )
 
-    scraper.scrape()
+    asyncio.run(scraper.run())
