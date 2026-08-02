@@ -1,6 +1,7 @@
 """
-GOOGLE MAPS REVIEWS SCRAPER FOR INDOBERT SENTIMENT ANALYSIS (GITHUB ACTIONS OPTIMIZED)
+GOOGLE MAPS REVIEWS SCRAPER FOR INDOBERT SENTIMENT ANALYSIS
 Target Location : Sade Village (Desa Sade), Lombok Tengah, NTB, Indonesia
+Environment     : GitHub Actions / Cloud Headless Ubuntu with Xvfb
 Author          : Senior Python Data Engineer & ML Researcher
 Language        : Python 3.13
 """
@@ -33,7 +34,16 @@ from selenium.common.exceptions import (
 
 
 class GoogleMapsScraper:
-    """Scraper profesional Google Maps Reviews untuk Dataset Penelitian Sentimen IndoBERT."""
+    """Scraper profesional Google Maps Reviews untuk Dataset Penelitian Sentimen IndoBERT.
+
+    Attributes:
+        target_url (str): URL target tempat wisata Desa Sade.
+        output_csv (str): Path file output CSV.
+        checkpoint_file (str): Path file checkpoint state JSON.
+        target_count (int): Target minimal dataset bersih (default: 5000).
+        autosave_interval (int): Interval autosave data (default: 100).
+        max_no_change (int): Threshold henti jika review stagnan (default: 10).
+    """
 
     def __init__(
         self,
@@ -41,8 +51,8 @@ class GoogleMapsScraper:
         output_csv: str = "sade_village_reviews_clean_5000.csv",
         checkpoint_file: str = "sade_checkpoint.json",
         target_count: int = 5000,
-        autosave_interval: int = 50,
-        max_no_change: int = 15
+        autosave_interval: int = 100,
+        max_no_change: int = 10
     ) -> None:
         self.target_url: str = target_url
         self.output_csv: str = output_csv
@@ -64,8 +74,8 @@ class GoogleMapsScraper:
         )
 
     def _init_driver(self) -> None:
-        """Inisialisasi Chrome WebDriver dengan opsi optimasi Virtual Display Xvfb / Cloud Server."""
-        logger.info("Menginisialisasi Chrome WebDriver di Cloud Environment...")
+        """Inisialisasi Chrome WebDriver dengan optimasi Virtual Display Xvfb Cloud Server."""
+        logger.info("Menginisialisasi Chrome WebDriver untuk GitHub Actions Server...")
         options = webdriver.ChromeOptions()
 
         options.add_argument("--window-size=1920,1080")
@@ -95,17 +105,18 @@ class GoogleMapsScraper:
         if os.path.exists(self.checkpoint_file) and os.path.exists(self.output_csv):
             try:
                 df_existing = pd.read_csv(self.output_csv)
-                self.scraped_data = df_existing.to_dict("records")
+                if not df_existing.empty and "ulasan_pengunjung" in df_existing.columns:
+                    self.scraped_data = df_existing.to_dict("records")
 
-                for item in self.scraped_data:
-                    hash_key = self._generate_hash(
-                        str(item.get("nama_pengguna")),
-                        str(item.get("ulasan_pengunjung")),
-                        str(item.get("tanggal_review"))
-                    )
-                    self.unique_hashes.add(hash_key)
+                    for item in self.scraped_data:
+                        hash_key = self._generate_hash(
+                            str(item.get("nama_pengguna")),
+                            str(item.get("ulasan_pengunjung")),
+                            str(item.get("tanggal_review"))
+                        )
+                        self.unique_hashes.add(hash_key)
 
-                logger.info(f"[RESUME] Berhasil memuat checkpoint! Total {len(self.scraped_data)} data.")
+                    logger.info(f"[RESUME] Berhasil memuat checkpoint! Total {len(self.scraped_data)} data.")
             except Exception as e:
                 logger.error(f"Gagal memuat checkpoint: {e}. Memulai baru.")
                 self.scraped_data = []
@@ -114,7 +125,6 @@ class GoogleMapsScraper:
     def _save_checkpoint(self) -> None:
         """Menyimpan dataset terkumpul ke file CSV."""
         if not self.scraped_data:
-            # Buat file CSV berstruktur dasar jika belum ada data
             df_empty = pd.DataFrame(columns=[
                 "review_id", "nama_pengguna", "rating", "ulasan_pengunjung",
                 "tanggal_review", "jumlah_suka", "local_guide", "scraped_at", "source", "place"
@@ -147,34 +157,76 @@ class GoogleMapsScraper:
         clean_str = f"{name.strip().lower()}_{text.strip().lower()}_{date.strip().lower()}"
         return str(hash(clean_str))
 
+    def _dismiss_cookie_consent(self) -> None:
+        """Bypass pop-up cookie consent Google yang muncul di IP Data Center Cloud."""
+        try:
+            consent_buttons = self.driver.find_elements(
+                By.XPATH,
+                "//button[contains(@aria-label, 'Accept') or contains(@aria-label, 'Terima') or contains(., 'Accept all') or contains(., 'Saya setuju') or contains(., 'Terima semua')]"
+            )
+            for btn in consent_buttons:
+                if btn.is_displayed():
+                    self.driver.execute_script("arguments[0].click();", btn)
+                    logger.info("Cookie consent dialog berhasil di-dismiss.")
+                    time.sleep(3)
+                    break
+        except Exception:
+            pass
+
     def _setup_page(self) -> None:
-        """Membuka halaman target Google Maps."""
+        """Membuka halaman target Google Maps dan memastikan tab Ulasan aktif."""
         if not self.driver:
             raise RuntimeError("Driver belum diaktifkan.")
 
         logger.info(f"Navigasi ke URL target Google Maps: {self.target_url}")
         self.driver.get(self.target_url)
-        time.sleep(8)
+        time.sleep(10)
 
-        # Klik Tab Ulasan
+        # 1. Penanganan Cookie Consent
+        self._dismiss_cookie_consent()
+
+        # 2. Klik Tab Ulasan / Reviews jika belum terbuka
         try:
-            buttons = self.driver.find_elements(
-                By.XPATH, 
-                "//button[contains(@aria-label, 'Ulasan') or contains(@aria-label, 'Reviews') or contains(., 'Ulasan')]"
+            review_tabs = self.driver.find_elements(
+                By.XPATH,
+                "//button[contains(@aria-label, 'Ulasan') or contains(@aria-label, 'Reviews') or contains(., 'Ulasan') or contains(., 'Reviews')]"
             )
-            if buttons:
-                self.driver.execute_script("arguments[0].click();", buttons[0])
-                time.sleep(4)
+            for tab in review_tabs:
+                if tab.is_displayed():
+                    self.driver.execute_script("arguments[0].click();", tab)
+                    logger.info("Tab ulasan diklik via Selenium.")
+                    time.sleep(4)
+                    break
         except Exception as e:
-            logger.warning(f"Info tab ulasan: {e}")
+            logger.warning(f"Info pembukaan tab ulasan: {e}")
+
+        # 3. Urutkan berdasarkan "Terbaru"
+        try:
+            sort_btns = self.driver.find_elements(
+                By.XPATH,
+                "//button[contains(@aria-label, 'Urutkan') or contains(@aria-label, 'Sort')]"
+            )
+            if sort_btns:
+                self.driver.execute_script("arguments[0].click();", sort_btns[0])
+                time.sleep(2)
+                options = self.driver.find_elements(
+                    By.XPATH,
+                    "//div[@role='menuitemradio' or @role='menuitem']"
+                )
+                if len(options) >= 2:
+                    self.driver.execute_script("arguments[0].click();", options[1])
+                    logger.info("Urutan review diubah ke 'Terbaru'.")
+                    time.sleep(3)
+        except Exception as e:
+            logger.warning(f"Sortir terbaru: {e}")
 
     def _find_scrollable_container(self) -> Any:
-        """Mencari kontainer scroll ulasan dengan multi-fallback."""
+        """Mencari kontainer scroll ulasan Google Maps secara akurat."""
         scroll_script = """
             let containers = Array.from(document.querySelectorAll('div'));
             return containers.find(c => {
                 let style = window.getComputedStyle(c);
-                return (style.overflowY === 'auto' || style.overflowY === 'scroll') && c.scrollHeight > 400;
+                return (style.overflowY === 'auto' || style.overflowY === 'scroll') && c.scrollHeight > 300;
             });
         """
         try:
@@ -193,7 +245,7 @@ class GoogleMapsScraper:
             elements = self.driver.find_elements(By.XPATH, xpath)
             for el in elements:
                 try:
-                    if el.size["height"] > 200:
+                    if el.size["height"] > 150:
                         return el
                 except Exception:
                     continue
@@ -201,6 +253,7 @@ class GoogleMapsScraper:
         return None
 
     def _expand_review_texts(self) -> None:
+        """Mengeklik tombol 'Selengkapnya' / 'More' pada ulasan terpotong."""
         try:
             more_buttons = self.driver.find_elements(
                 By.XPATH,
@@ -214,6 +267,7 @@ class GoogleMapsScraper:
 
     @staticmethod
     def _clean_original_text(raw_text: str) -> str:
+        """Mempertahankan HANYA teks ulasan bahasa asli (original text)."""
         if not raw_text:
             return ""
 
@@ -232,6 +286,7 @@ class GoogleMapsScraper:
         return " ".join(raw_text.replace("\n", " ").split())
 
     def _extract_reviews_from_dom(self) -> int:
+        """Mengekstrak seluruh elemen ulasan dari DOM terkini."""
         soup = BeautifulSoup(self.driver.page_source, "html.parser")
         
         review_cards = soup.find_all("div", attrs={"data-review-id": True})
@@ -241,9 +296,13 @@ class GoogleMapsScraper:
         new_records_added = 0
         for card in review_cards:
             try:
+                # 1. Nama Pengguna
                 name_el = card.find("div", class_=lambda c: c and ("d4rBO" in c or "header" in c or "d4r55" in c))
+                if not name_el:
+                    name_el = card.find("button", class_=lambda c: c and "WEB" in c)
                 nama_pengguna = name_el.text.strip() if name_el else "Anonym"
 
+                # 2. Rating Ulasan
                 rating = 0
                 star_el = card.find("span", attrs={"aria-label": lambda a: a and ("bintang" in a.lower() or "star" in a.lower())})
                 if star_el:
@@ -251,11 +310,13 @@ class GoogleMapsScraper:
                     if match:
                         rating = int(match.group(1))
 
+                # 3. Tanggal Ulasan
                 date_el = card.find("span", class_=lambda c: c and ("r0355b" in c or "rsqaWe" in c))
                 if not date_el:
                     date_el = card.find("span", text=re.compile(r"(lalu|ago|bulan|tahun|minggu|hari)", re.I))
                 tanggal_review = date_el.text.strip() if date_el else ""
 
+                # 4. Teks Ulasan
                 text_el = card.find("span", class_=lambda c: c and ("wi832d" in c or "MyT2O" in c or "wiI7pd" in c))
                 if not text_el:
                     text_el = card.find("div", class_=lambda c: c and ("TOw1ed" in c or "MyEned" in c))
@@ -266,6 +327,7 @@ class GoogleMapsScraper:
                 if len(clean_original_text) < 3:
                     continue
 
+                # 5. Jumlah Suka
                 like_btn = card.find("button", attrs={"aria-label": lambda a: a and ("suka" in a.lower() or "like" in a.lower())})
                 jumlah_suka = 0
                 if like_btn and "aria-label" in like_btn.attrs:
@@ -273,11 +335,13 @@ class GoogleMapsScraper:
                     if match:
                         jumlah_suka = int(match.group(1))
 
+                # 6. Local Guide
                 local_guide = "Tidak"
                 lg_el = card.find(text=re.compile(r"Local Guide", re.I))
                 if lg_el or card.find("span", class_=lambda c: c and "RfnDt" in c):
                     local_guide = "Ya"
 
+                # Hash Deduplikasi
                 hash_key = self._generate_hash(nama_pengguna, clean_original_text, tanggal_review)
 
                 if hash_key not in self.unique_hashes:
@@ -302,6 +366,7 @@ class GoogleMapsScraper:
         return new_records_added
 
     def _scroll_action(self, scroll_container: Any) -> None:
+        """Kombinasi JavaScript Scroll & Keyboard PAGE_DOWN / END untuk keandalan maksimal."""
         if scroll_container:
             try:
                 self.driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", scroll_container)
@@ -309,13 +374,20 @@ class GoogleMapsScraper:
             except Exception:
                 pass
 
-        self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        # Fallback Keyboard Scroll
+        try:
+            body = self.driver.find_element(By.TAG_NAME, "body")
+            body.send_keys(Keys.PAGE_DOWN)
+            body.send_keys(Keys.END)
+        except Exception:
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
 
     def scrape(self) -> None:
+        """Fungsi eksekusi utama Scraping & Checkpoint System."""
         self._load_checkpoint()
         self._init_driver()
         
-        # Buat file CSV kosong awal agar artefak GitHub Actions selalu menemukan file jika terjadi timeout
+        # Buat/Inisialisasi file CSV awal
         self._save_checkpoint()
 
         try:
@@ -335,12 +407,13 @@ class GoogleMapsScraper:
 
                 pbar.update(current_total_count - pbar.n)
 
+                # Simpan instan setiap ada ulasan baru
                 if new_items_count > 0:
                     self._save_checkpoint()
 
                 if current_total_count == last_total_count:
                     no_new_data_counter += 1
-                    logger.warning(f"Scroll dilakukan, belum ada ulasan baru ({no_new_data_counter}/{self.max_no_change})")
+                    logger.warning(f"Scroll dilakukan, tidak ada data baru ({no_new_data_counter}/{self.max_no_change})")
 
                     if no_new_data_counter % 3 == 0:
                         scroll_container = self._find_scrollable_container()
@@ -349,7 +422,7 @@ class GoogleMapsScraper:
                     last_total_count = current_total_count
 
                 if no_new_data_counter >= self.max_no_change:
-                    logger.info("Ulasan telah habis atau mencapai batas percobaan scroll.")
+                    logger.info(f"Ulasan telah habis atau stagnan selama {self.max_no_change} kali scroll.")
                     break
 
                 if current_total_count >= self.target_count:
@@ -361,7 +434,7 @@ class GoogleMapsScraper:
 
             pbar.close()
             self._save_checkpoint()
-            logger.success(f"PROSES SELESAI! Total dataset original Desa Sade: {len(self.scraped_data)} data.")
+            logger.success(f"PROSES SELESAI! Total dataset original Desa Sade tersimpan: {len(self.scraped_data)} data.")
 
         except Exception as e:
             logger.critical(f"Terjadi error fatal selama proses scraping: {e}")
@@ -372,6 +445,7 @@ class GoogleMapsScraper:
 
 
 if __name__ == "__main__":
+    # URL Google Maps Direct Reviews Feed Sade Village
     URL_DESA_SADE = (
         "https://www.google.com/maps/place/Sade+Village/"
         "@-8.839218,116.2917036,17z/data=!4m8!3m7!"
@@ -385,7 +459,7 @@ if __name__ == "__main__":
         checkpoint_file="sade_checkpoint.json",
         target_count=5000,
         autosave_interval=50,
-        max_no_change=15
+        max_no_change=10
     )
 
     scraper.scrape()
