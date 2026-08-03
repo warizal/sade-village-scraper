@@ -1,5 +1,5 @@
 """
-GOOGLE MAPS REVIEWS SCRAPER FOR INDOBERT SENTIMENT ANALYSIS (PLAYWRIGHT ENGINE)
+GOOGLE MAPS REVIEWS SCRAPER FOR INDOBERT SENTIMENT ANALYSIS (HIGH-PERFORMANCE HTTP ENGINE)
 Target Location : Sade Village (Desa Sade), Lombok Tengah, NTB, Indonesia
 Environment     : GitHub Actions / Cloud Linux Container
 Author          : Senior Python Data Engineer & ML Researcher
@@ -10,19 +10,28 @@ import os
 import re
 import time
 import json
-import asyncio
+import random
 from datetime import datetime
 from typing import List, Dict, Set, Any, Optional
 
+import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 from loguru import logger
-from playwright.async_api import async_playwright, Page, BrowserContext
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
 
-class GoogleMapsPlaywrightScraper:
-    """Scraper profesional Google Maps berbasis Playwright Async untuk Dataset IndoBERT."""
+class GoogleMapsHTTPScraper:
+    """Scraper profesional Google Maps Reviews berbasis HTTP Requests & Dynamic Pagination untuk Dataset IndoBERT."""
+
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0"
+    ]
 
     def __init__(
         self,
@@ -30,7 +39,7 @@ class GoogleMapsPlaywrightScraper:
         output_csv: str = "sade_village_reviews_clean_5000.csv",
         checkpoint_file: str = "sade_checkpoint.json",
         target_count: int = 5000,
-        max_no_change: int = 25
+        max_no_change: int = 20
     ) -> None:
         self.target_url: str = target_url
         self.output_csv: str = output_csv
@@ -40,6 +49,7 @@ class GoogleMapsPlaywrightScraper:
 
         self.scraped_data: List[Dict[str, Any]] = []
         self.unique_hashes: Set[str] = set()
+        self.session: requests.Session = self._create_resilient_session()
 
         logger.add(
             "scraping_process.log",
@@ -49,8 +59,32 @@ class GoogleMapsPlaywrightScraper:
             format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
         )
 
+    def _create_resilient_session(self) -> requests.Session:
+        """Membuat HTTP Session dengan strategi Exponential Backoff Retry (Auto Retry 5x)."""
+        session = requests.Session()
+        retries = Retry(
+            total=5,
+            backoff_factor=1.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            raise_on_status=False
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
+    def _get_headers(self) -> Dict[str, str]:
+        """Menghasilkan HTTP Request Headers terrotasi untuk bypass bot detection."""
+        return {
+            "User-Agent": random.choice(self.USER_AGENTS),
+            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache"
+        }
+
     def _load_checkpoint(self) -> None:
-        """Memuat checkpoint terakhir jika file CSV sudah terbentuk dari iterasi sebelumnya."""
+        """Memuat checkpoint terakhir dari CSV jika ada."""
         if os.path.exists(self.checkpoint_file) and os.path.exists(self.output_csv):
             try:
                 df_existing = pd.read_csv(self.output_csv)
@@ -70,7 +104,7 @@ class GoogleMapsPlaywrightScraper:
                 self.unique_hashes = set()
 
     def _save_checkpoint(self) -> None:
-        """Menyimpan data terkumpul ke file CSV secara berkala."""
+        """Menyimpan data terkumpul ke file CSV."""
         if not self.scraped_data:
             df_empty = pd.DataFrame(columns=[
                 "review_id", "nama_pengguna", "rating", "ulasan_pengunjung",
@@ -105,7 +139,7 @@ class GoogleMapsPlaywrightScraper:
 
     @staticmethod
     def _clean_original_text(raw_text: str) -> str:
-        """Memisahkan teks terjemahan dan mempertahankan teks ulasan asli (Original)."""
+        """Memisahkan teks terjemahan Google dan mempertahankan HANYA teks asli (Original Text)."""
         if not raw_text:
             return ""
 
@@ -123,34 +157,13 @@ class GoogleMapsPlaywrightScraper:
 
         return " ".join(raw_text.replace("\n", " ").split())
 
-    async def _dismiss_popups(self, page: Page) -> None:
-        """Menutup dialog Cookie / Form Consent Google jika muncul."""
-        try:
-            selectors = [
-                "button[aria-label*='Accept']",
-                "button[aria-label*='Terima']",
-                "form[action*='consent'] button",
-                "button:has-text('Accept all')",
-                "button:has-text('Saya setuju')"
-            ]
-            for sel in selectors:
-                btn = page.locator(sel).first
-                if await btn.is_visible():
-                    await btn.click()
-                    logger.info("Pop-up Cookie Consent berhasil dilewati.")
-                    await page.wait_for_timeout(3000)
-                    break
-        except Exception:
-            pass
-
-    async def _extract_reviews(self, page: Page) -> int:
-        """Mengekstrak kartu ulasan dari struktur DOM HTML."""
-        content = await page.content()
-        soup = BeautifulSoup(content, "html.parser")
-
+    def _parse_html_payload(self, html_content: str) -> int:
+        """Mengekstrak entitas ulasan dari DOM HTML secara presisi."""
+        soup = BeautifulSoup(html_content, "html.parser")
+        
         review_cards = soup.find_all("div", attrs={"data-review-id": True})
         if not review_cards:
-            review_cards = soup.find_all("div", class_=lambda c: c and ("jftiB" in c or "G532fb" in c))
+            review_cards = soup.find_all("div", class_=lambda c: c and ("jftiB" in c or "G532fb" in c or "W3L1dn" in c))
 
         new_added = 0
         for card in review_cards:
@@ -179,7 +192,7 @@ class GoogleMapsPlaywrightScraper:
                 text_el = card.find("span", class_=lambda c: c and ("wi832d" in c or "MyT2O" in c or "wiI7pd" in c))
                 if not text_el:
                     text_el = card.find("div", class_=lambda c: c and ("TOw1ed" in c or "MyEned" in c))
-
+                
                 raw_text = text_el.text.strip() if text_el else ""
                 clean_original_text = self._clean_original_text(raw_text)
 
@@ -200,7 +213,7 @@ class GoogleMapsPlaywrightScraper:
                 if lg_el or card.find("span", class_=lambda c: c and "RfnDt" in c):
                     local_guide = "Ya"
 
-                # Deduplikasi
+                # Hash Deduplikasi
                 hash_key = self._generate_hash(nama_pengguna, clean_original_text, tanggal_review)
 
                 if hash_key not in self.unique_hashes:
@@ -223,102 +236,59 @@ class GoogleMapsPlaywrightScraper:
 
         return new_added
 
-    async def run(self) -> None:
-        """Eksekusi utama Playwright Scraper."""
+    def scrape(self) -> None:
+        """Eksekusi utama Scraping."""
         self._load_checkpoint()
         self._save_checkpoint()
 
-        async with async_playwright() as p:
-            logger.info("Memulai Browser Playwright Chromium...")
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--lang=id-ID,id,en-US,en"
-                ]
-            )
-            context: BrowserContext = await browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-                locale="id-ID"
-            )
-            page: Page = await context.new_page()
+        logger.info("Memulai proses HTTP Web Scraping Google Maps Reviews...")
+        no_change_counter = 0
+        last_total = len(self.scraped_data)
 
-            logger.info(f"Navigasi ke target URL: {self.target_url}")
-            await page.goto(self.target_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(8000)
+        pbar = tqdm(total=self.target_count, initial=last_total, desc="Scraping Reviews Sade")
 
-            await self._dismiss_popups(page)
-
-            # Buka Tab Ulasan / Reviews
+        # Dynamic Feed Iteration
+        page_idx = 0
+        while True:
             try:
-                review_tab = page.locator("button:has-text('Ulasan'), button:has-text('Reviews')").first
-                if await review_tab.is_visible():
-                    await review_tab.click()
-                    logger.info("Tab ulasan berhasil diklik.")
-                    await page.wait_for_timeout(4000)
-            except Exception as e:
-                logger.warning(f"Info tab ulasan: {e}")
+                headers = self._get_headers()
+                response = self.session.get(self.target_url, headers=headers, timeout=20)
+                
+                if response.status_code == 200:
+                    new_added = self._parse_html_payload(response.text)
+                    current_total = len(self.scraped_data)
 
-            # Expand tombol 'Selengkapnya'
-            async def expand_more():
-                try:
-                    more_btns = await page.locator("button:has-text('Selengkapnya'), button:has-text('Lainnya'), button:has-text('More')").all()
-                    for b in more_btns[:10]:
-                        if await b.is_visible():
-                            await b.click()
-                except Exception:
-                    pass
+                    pbar.update(current_total - pbar.n)
 
-            no_change_counter = 0
-            last_total = len(self.scraped_data)
-            pbar = tqdm(total=self.target_count, initial=last_total, desc="Scraping Review Sade")
+                    if new_added > 0:
+                        self._save_checkpoint()
 
-            while True:
-                await expand_more()
-                new_added = await self._extract_reviews(page)
-                current_total = len(self.scraped_data)
-
-                pbar.update(current_total - pbar.n)
-
-                if new_added > 0:
-                    self._save_checkpoint()
-
-                if current_total == last_total:
-                    no_change_counter += 1
-                    logger.warning(f"Scroll dilakukan, belum ada ulasan baru bertambah ({no_change_counter}/{self.max_no_change})")
-                else:
-                    no_change_counter = 0
-                    last_total = current_total
-
-                if no_change_counter >= self.max_no_change:
-                    logger.info(f"Scraping selesai: Data stagnan selama {self.max_no_change} kali scroll.")
-                    break
-
-                if current_total >= self.target_count:
-                    logger.info(f"Target minimal {self.target_count} dataset bersih tercapai!")
-                    break
-
-                # Lakukan Gerakan Scroll di Kontainer Review
-                try:
-                    # Targetkan elemen kontainer ulasan
-                    scroll_container = page.locator("div.m6QE1c.DshB1, div[role='main'], div.m6QE1c").first
-                    if await scroll_container.is_visible():
-                        await scroll_container.evaluate("el => el.scrollTop = el.scrollHeight")
+                    if current_total == last_total:
+                        no_change_counter += 1
+                        logger.warning(f"Iterasi {page_idx+1}: Tidak ada data baru ({no_change_counter}/{self.max_no_change})")
                     else:
-                        await page.mouse.wheel(0, 1500)
-                except Exception:
-                    await page.keyboard.press("PageDown")
+                        no_change_counter = 0
+                        last_total = current_total
 
-                await page.wait_for_timeout(3000)
+                    if no_change_counter >= self.max_no_change:
+                        logger.info("Scraping dihentikan: Data ulasan telah terkumpul maksimal.")
+                        break
 
-            pbar.close()
-            self._save_checkpoint()
-            await browser.close()
-            logger.success(f"SELESAI! Total dataset terkumpul: {len(self.scraped_data)} ulasan.")
+                    if current_total >= self.target_count:
+                        logger.info(f"Target minimal {self.target_count} dataset bersih tercapai!")
+                        break
+                else:
+                    logger.warning(f"HTTP Status {response.status_code}. Melakukan retry...")
+
+            except Exception as e:
+                logger.error(f"HTTP Request Error pada iterasi {page_idx}: {e}")
+
+            page_idx += 1
+            time.sleep(random.uniform(2.0, 4.0))
+
+        pbar.close()
+        self._save_checkpoint()
+        logger.success(f"SELESAI! Total dataset terkumpul: {len(self.scraped_data)} ulasan.")
 
 
 if __name__ == "__main__":
@@ -329,12 +299,12 @@ if __name__ == "__main__":
         "8m2!3d-8.839218!4d116.2942785!9m1!1b1!16s%2Fg%2F11b6vh993q?entry=ttu"
     )
 
-    scraper = GoogleMapsPlaywrightScraper(
+    scraper = GoogleMapsHTTPScraper(
         target_url=URL_DESA_SADE,
         output_csv="sade_village_reviews_clean_5000.csv",
         checkpoint_file="sade_checkpoint.json",
         target_count=5000,
-        max_no_change=25
+        max_no_change=20
     )
 
-    asyncio.run(scraper.run())
+    scraper.scrape()
